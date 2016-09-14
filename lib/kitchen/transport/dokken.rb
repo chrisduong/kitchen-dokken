@@ -41,6 +41,7 @@ module Kitchen
       default_config :docker_host_url, ENV['DOCKER_HOST'] || 'unix:///var/run/docker.sock'
       default_config :read_timeout, 3600
       default_config :write_timeout, 3600
+      default_config :host_ip_override, false
 
       # (see Base#connection)
       def connection(state, &block)
@@ -64,13 +65,13 @@ module Kitchen
 
           with_retries { @runner = ::Docker::Container.get(instance_name, {}, docker_connection) }
           with_retries do
-            o = @runner.exec(Shellwords.shellwords(command)) { |_stream, chunk| print "#{chunk}" }
+            o = @runner.exec(Shellwords.shellwords(command)) { |_stream, chunk| print chunk.to_s }
             @exit_code = o[2]
           end
 
           if @exit_code != 0
-            fail Transport::DockerExecFailed,
-                 "Docker Exec (#{@exit_code}) for command: [#{command}]"
+            raise Transport::DockerExecFailed,
+                  "Docker Exec (#{@exit_code}) for command: [#{command}]"
           end
 
           # Disabling this for now.. the Docker ZFS driver won't let us
@@ -83,13 +84,16 @@ module Kitchen
         end
 
         def upload(locals, remote)
-          if options[:docker_host_url] =~ /unix:/
+          if options[:host_ip_override]
+            # Allow connecting to any ip/hostname to support sibling containers
+            ip = options[:host_ip_override]
+          elsif options[:docker_host_url] =~ /unix:/
             # we should read the proper mapped ip, since this allows us to upload the files
             ip = options[:data_container][:NetworkSettings][:Ports][:"22/tcp"][0][:HostIp]
           elsif options[:docker_host_url] =~ /tcp:/
             ip = options[:docker_host_url].split('tcp://')[1].split(':')[0]
           else
-            fail Kitchen::UserError, 'docker_host_url must be tcp:// or unix://'
+            raise Kitchen::UserError, 'docker_host_url must be tcp:// or unix://'
           end
 
           port = options[:data_container][:NetworkSettings][:Ports][:"22/tcp"][0][:HostPort]
@@ -116,7 +120,7 @@ module Kitchen
         end
 
         def login_command
-          @runner = "#{options[:instance_name]}"
+          @runner = options[:instance_name].to_s
           args = ['exec', '-it', @runner, '/bin/bash', '-login', '-i']
           LoginCommand.new('docker', args)
         end
@@ -136,10 +140,10 @@ module Kitchen
           options[:image_prefix]
         end
 
-        def with_retries(&block)
+        def with_retries
           tries = 20
           begin
-            block.call
+            yield
             # Only catch errors that can be fixed with retries.
           rescue ::Docker::Error::ServerError, # 404
                  ::Docker::Error::UnexpectedResponseError, # 400
@@ -162,6 +166,7 @@ module Kitchen
       # @api private
       def connection_options(data) # rubocop:disable Metrics/MethodLength
         opts = {}
+        opts[:host_ip_override] = config[:host_ip_override]
         opts[:docker_host_url] = config[:docker_host_url]
         opts[:docker_host_options] = ::Docker.options
         opts[:data_container] = data[:data_container]

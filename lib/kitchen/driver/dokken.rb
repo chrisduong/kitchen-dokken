@@ -32,14 +32,24 @@ module Kitchen
     # @author Sean OMeara <sean@chef.io>
     class Dokken < Kitchen::Driver::Base
       default_config :pid_one_command, 'sh -c "trap exit 0 SIGTERM; while :; do sleep 1; done"'
-      default_config :privileged, false
       default_config :image_prefix, nil
-      default_config :chef_version, '12.5.1'
+      default_config :chef_image, 'chef/chef'
+      default_config :chef_version, 'latest'
       default_config :data_image, 'someara/kitchen-cache:latest'
       default_config :docker_host_url, ENV['DOCKER_HOST'] || 'unix:///var/run/docker.sock'
       default_config :read_timeout, 3600
       default_config :write_timeout, 3600
       default_config :api_retries, 20
+      # docker run args
+      default_config :privileged, false
+      default_config :hostname, nil
+      default_config :binds, nil # volumes to mount
+      default_config :links, nil
+      default_config :cap_add, nil
+      default_config :cap_drop, nil
+      default_config :security_opt, nil
+      default_config :forward, nil
+      default_config :network_mode, 'bridge'
 
       # (see Base#create)
       def create(state)
@@ -88,39 +98,39 @@ module Kitchen
       def delete_work_image
         return unless ::Docker::Image.exist?(work_image, docker_connection)
         with_retries { @work_image = ::Docker::Image.get(work_image, docker_connection) }
-        with_retries { @work_image.remove(force: true) }
+
+        begin
+          with_retries { @work_image.remove(force: true) }
+        rescue ::Docker::Error::ConflictError
+          debug "driver - #{work_image} cannot be removed"
+        end
       end
 
       def build_work_image(state)
         # require 'pry' ; binding.pry
-        
+
         return if ::Docker::Image.exist?(work_image, docker_connection)
 
-        FileUtils.mkdir_p context_root
-        File.write("#{context_root}/Dockerfile", work_image_dockerfile)
-
-        begin
-          with_retries do
-            @intermediate_image = ::Docker::Image.build_from_dir(
-              context_root,
-              {
-                # 'nocache' => true,
-                # 'forcerm' => true,
-                # 'q' => true,
-                't' => work_image
-              },
-              docker_connection
-            )
+        Dir.mktmpdir do |context_root|
+          File.write("#{context_root}/Dockerfile", work_image_dockerfile)
+          begin
+            with_retries do
+              @intermediate_image = ::Docker::Image.build_from_dir(
+                context_root,
+                {
+                  # 'nocache' => true,
+                  # 'forcerm' => true,
+                  # 'q' => true,
+                  't' => work_image
+                },
+                docker_connection
+              )
+            end
+          rescue Exception => e
+            raise "work_image build failed: #{e}"
           end
-        rescue Exception => e
-          fail  "work_image build failed: #{e}" 
+          state[:work_image] = work_image
         end
-        state[:work_image] = work_image
-      end
-
-      def context_root
-        tmpdir = Dir.tmpdir
-        "#{tmpdir}/dokken/#{instance_name}"
       end
 
       def work_image_dockerfile
@@ -138,7 +148,8 @@ module Kitchen
       end
 
       def instance_name
-        instance.name
+        prefix = File.basename(FileUtils.pwd)
+        "#{prefix}-#{instance.name}"
       end
 
       def delete_chef_container
@@ -185,9 +196,18 @@ module Kitchen
           'name' => runner_container_name,
           'Cmd' => Shellwords.shellwords(config[:pid_one_command]),
           'Image' => "#{repo(work_image)}:#{tag(work_image)}",
+          'Hostname' => config[:hostname],
+          'ExposedPorts' => exposed_ports({}, config[:forward]),
           'HostConfig' => {
             'Privileged' => config[:privileged],
-            'VolumesFrom' => [chef_container_name, data_container_name]
+            'VolumesFrom' => [chef_container_name, data_container_name],
+            'Binds' => Array(config[:binds]),
+            'Links' => Array(config[:links]),
+            'CapAdd' => Array(config[:cap_add]),
+            'CapDrop' => Array(config[:cap_drop]),
+            'SecurityOpt' => Array(config[:security_opt]),
+            'NetworkMode' => config[:network_mode],
+            'PortBindings' => port_forwards({}, config[:forward])
           }
         )
         state[:runner_container] = runner_container.json
@@ -198,11 +218,7 @@ module Kitchen
         data_container = run_container(
           'name' => data_container_name,
           'Image' => "#{repo(data_image)}:#{tag(data_image)}",
-          'PortBindings' => {
-            '22/tcp' => [
-              { 'HostPort' => '' }
-            ]
-          },
+          'PortBindings' => port_forwards({}, '22'),
           'PublishAllPorts' => true
         )
         # require 'pry' ; binding.pry
@@ -229,7 +245,7 @@ module Kitchen
           )
           state[:chef_container] = chef_container.json
         rescue
-          debug "driver - #{chef_container_name} alreay exists"
+          debug "driver - #{chef_container_name} already exists"
         end
       end
 
@@ -284,24 +300,20 @@ module Kitchen
       end
 
       def stop_container(name)
-        begin
-          with_retries { @container = ::Docker::Container.get(name, docker_connection) }
-          with_retries do
-            @container.stop(force: true)
-            wait_running_state(name, false)
-          end
-        rescue ::Docker::Error::NotFoundError
-          debug "Container #{name} not found. Nothing to stop."
+        with_retries { @container = ::Docker::Container.get(name, docker_connection) }
+        with_retries do
+          @container.stop(force: true)
+          wait_running_state(name, false)
         end
+      rescue ::Docker::Error::NotFoundError
+        debug "Container #{name} not found. Nothing to stop."
       end
 
       def delete_container(name)
-        begin
-          with_retries { @container = ::Docker::Container.get(name, docker_connection) }
-          with_retries { @container.delete(force: true, v: true) }
-        rescue ::Docker::Error::NotFoundError
-          debug "Container #{name} not found. Nothing to delete."
-        end
+        with_retries { @container = ::Docker::Container.get(name, docker_connection) }
+        with_retries { @container.delete(force: true, v: true) }
+      rescue ::Docker::Error::NotFoundError
+        debug "Container #{name} not found. Nothing to delete."
       end
 
       def wait_running_state(name, v)
@@ -325,7 +337,7 @@ module Kitchen
       end
 
       def chef_image
-        "chef/chef:#{chef_version}"
+        "#{config[:chef_image]}:#{chef_version}"
       end
 
       def chef_version
@@ -333,7 +345,7 @@ module Kitchen
       end
 
       def data_container_name
-        "#{instance.name}-data"
+        "#{instance_name}-data"
       end
 
       def data_image
@@ -344,26 +356,44 @@ module Kitchen
         config[:image]
       end
 
+      def exposed_ports(config, rules)
+        Array(rules).each do |prt_string|
+          guest, host = prt_string.to_s.split(':').reverse
+          config["#{guest}/tcp"] = {}
+        end
+        config
+      end
+
+      def port_forwards(config, rules)
+        Array(rules).each do |prt_string|
+          guest, host = prt_string.to_s.split(':').reverse
+          config["#{guest}/tcp"] = [{
+            HostPort: host || ''
+          }]
+        end
+        config
+      end
+
       def pull_if_missing(image)
         return if ::Docker::Image.exist?("#{repo(image)}:#{tag(image)}", docker_connection)
         pull_image image
       end
 
-      def pull_image(image)        
-        with_retries {
+      def pull_image(image)
+        with_retries do
           ::Docker::Image.create({ 'fromImage' => "#{repo(image)}:#{tag(image)}" }, docker_connection)
-        }
+        end
       end
 
       def runner_container_name
-        "#{instance.name}"
+        instance_name.to_s
       end
 
-      def with_retries(&block)
+      def with_retries
         tries = api_retries
         begin
-          block.call
-          # Only catch errors that can be fixed with retries.
+          yield
+        # Only catch errors that can be fixed with retries.
         rescue ::Docker::Error::ServerError, # 404
                ::Docker::Error::UnexpectedResponseError, # 400
                ::Docker::Error::TimeoutError,
